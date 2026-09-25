@@ -1,92 +1,79 @@
 import axios from 'axios';
+import { logger } from './logger.js';
 
-const AURA_API_BASE_URL = process.env.AURA_API_BASE_URL || 'https://aurahub-api.ashwathama249.workers.dev';
-const UPLOAD_FOLDER_ID = process.env.UPLOAD_FOLDER_ID;
+function getApiBaseUrl() {
+  return process.env.AURA_API_BASE_URL || 'https://aurahub-api-hono.ashwathama249.workers.dev';
+}
 
-const BROWSER_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-/**
- * Resolves a Streamtape fileId to a direct streaming MP4 link.
- */
-export async function resolveStreamtapeUrl(fileId) {
-  if (!fileId || typeof fileId !== 'string') {
-    return { ok: false, error: 'Invalid fileId' };
-  }
-
-  const cleanId = fileId.trim();
-
-  try {
-    const embedUrl = `https://streamtape.com/e/${cleanId}`;
-    const response = await fetch(embedUrl, {
-      headers: { 'User-Agent': BROWSER_USER_AGENT },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      return { ok: false, status: response.status, error: `Streamtape returned status ${response.status}` };
-    }
-
-    const html = await response.text();
-
-    if (
-      html.includes('File not found') ||
-      html.includes('Video has been removed') ||
-      html.includes('File was deleted')
-    ) {
-      return { ok: false, status: 404, error: 'File deleted on Streamtape' };
-    }
-
-    const robotMatch = html.match(
-      /document\.getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*(.+?);/
-    );
-
-    if (!robotMatch || !robotMatch[1]) {
-      return { ok: false, status: 502, error: 'Could not find robotlink on Streamtape' };
-    }
-
-    const rawExpr = robotMatch[1].trim();
-    const evaluated = Function(`"use strict"; return (${rawExpr});`)();
-    const streamUrl = evaluated.startsWith('//') ? `https:${evaluated}` : evaluated;
-
-    if (!streamUrl || !streamUrl.startsWith('http')) {
-      return { ok: false, status: 500, error: 'Parsed invalid stream URL' };
-    }
-
-    return { ok: true, streamUrl };
-  } catch (err) {
-    return { ok: false, status: 500, error: err.message };
-  }
+function getUploadFolderId() {
+  return process.env.UPLOAD_FOLDER_ID || 'QU3yuiRZZFw';
 }
 
 /**
- * Starts a Streamtape remote upload from direct stream URL into the Aurahub folder.
+ * Starts a Streamtape remote upload directly from any Streamtape URL (e.g. https://streamtape.com/v/ID or /e/ID).
+ * Conforms to Cloudflare Worker OpenAPI spec:
+ * GET /remote/add?url={url}&folder={folder}&name={name}
  */
-export async function startRemoteClone(streamUrl) {
+export async function startRemoteClone(videoUrl, customFolder = null) {
+  if (!videoUrl) {
+    return { ok: false, error: 'videoUrl is required' };
+  }
+
+  const folder = customFolder || getUploadFolderId();
+  if (!folder) {
+    logger.error('[Streamtape] UPLOAD_FOLDER_ID is missing in environment variables');
+    return { ok: false, error: 'UPLOAD_FOLDER_ID is required' };
+  }
+
+  const baseUrl = getApiBaseUrl();
+
   try {
-    const response = await axios.get(`${AURA_API_BASE_URL}/remote/add`, {
-      params: { url: streamUrl, folder: UPLOAD_FOLDER_ID },
-      timeout: 15000,
+    const response = await axios.get(`${baseUrl}/remote/add`, {
+      params: {
+        url: videoUrl,
+        folder: folder,
+      },
+      timeout: 20000,
     });
 
-    const remoteId = response.data?.result?.id || response.data?.id;
-    if (!remoteId) {
-      return { ok: false, error: 'No remote upload ID returned' };
+    const data = response.data;
+    const remoteId = data?.result?.id || data?.id;
+    const linkId = data?.result?.linkid || data?.linkid;
+    const link = data?.result?.link || data?.link;
+
+    if (!remoteId && !linkId) {
+      return { ok: false, error: data?.msg || data?.message || 'No upload ID or link ID returned' };
     }
 
-    return { ok: true, remoteId };
+    return {
+      ok: true,
+      remoteId,
+      linkId,
+      link,
+    };
   } catch (err) {
-    return { ok: false, error: err.response?.data?.message || err.message };
+    const status = err.response?.status;
+    const errData = err.response?.data;
+    const msg = errData?.error?.message || errData?.message || errData?.msg || err.message;
+    logger.error(`[Streamtape] /remote/add failed (status ${status}):`, typeof msg === 'object' ? JSON.stringify(msg) : msg);
+    return { ok: false, status, error: typeof msg === 'object' ? JSON.stringify(msg) : msg };
   }
 }
 
 /**
  * Checks the status of an ongoing remote upload on Streamtape.
+ * Conforms to Cloudflare Worker OpenAPI spec:
+ * GET /remote/status?id={id}&limit={limit}
  */
 export async function checkRemoteCloneStatus(remoteId) {
+  if (!remoteId) {
+    return { status: 'error', error: 'remoteId is required' };
+  }
+
+  const baseUrl = getApiBaseUrl();
+
   try {
-    const response = await axios.get(`${AURA_API_BASE_URL}/remote/status`, {
+    const response = await axios.get(`${baseUrl}/remote/status`, {
       params: { id: remoteId },
       timeout: 15000,
     });
@@ -97,8 +84,11 @@ export async function checkRemoteCloneStatus(remoteId) {
       return { status: 'unknown' };
     }
 
-    if (data.status === 'finished' && data.linkid) {
-      return { status: 'finished', linkid: data.linkid };
+    if ((data.status === 'finished' || data.status === 'completed') && (data.linkid || data.linkId)) {
+      return {
+        status: 'finished',
+        linkId: data.linkid || data.linkId,
+      };
     }
 
     if (data.status === 'error') {
@@ -111,22 +101,29 @@ export async function checkRemoteCloneStatus(remoteId) {
       bytesTotal: data.bytes_total,
     };
   } catch (err) {
-    return { status: 'error', error: err.message };
+    const status = err.response?.status;
+    const errData = err.response?.data;
+    const msg = errData?.error?.message || errData?.message || err.message;
+    logger.error(`[Streamtape] /remote/status failed (status ${status}):`, msg);
+    return { status: 'error', error: msg };
   }
 }
 
 /**
  * Deletes the old file from Streamtape via the proxy worker.
+ * Conforms to Cloudflare Worker OpenAPI spec:
+ * DELETE /fs/files/delete/{file_id}
  */
 export async function deleteStreamtapeFile(fileId) {
   if (!fileId) return false;
+  const baseUrl = getApiBaseUrl();
   try {
-    await axios.delete(`${AURA_API_BASE_URL}/fs/files/delete/${fileId}`, {
+    await axios.delete(`${baseUrl}/fs/files/delete/${fileId}`, {
       timeout: 10000,
     });
     return true;
   } catch (err) {
-    console.warn(`[Streamtape] Delete old file ${fileId} warning:`, err.message);
+    logger.warn(`[Streamtape] Delete file ${fileId} warning:`, err.response?.data?.message || err.message);
     return false;
   }
 }

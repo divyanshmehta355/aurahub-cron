@@ -1,22 +1,28 @@
 import Video from '../models/Video.js';
 import {
-  resolveStreamtapeUrl,
   startRemoteClone,
   checkRemoteCloneStatus,
   deleteStreamtapeFile,
 } from '../lib/streamtape.js';
 import { invalidateVideoCaches } from '../config/redis.js';
+import { logger } from '../lib/logger.js';
 
 /**
- * Executes a full Auto-Clone cycle:
- * 1. Finalize in-flight remote uploads.
- * 2. Identify aging videos (> 75 days) and initiate remote clones.
+ * Executes a full Auto-Clone cycle with standard console logging.
+ * Uses AGING_MINUTES_THRESHOLD (in minutes) to determine candidate videos.
  */
 export async function runAutoCloneCycle() {
-  const thresholdDays = parseInt(process.env.AGING_DAYS_THRESHOLD || '75', 10);
+  const startTime = Date.now();
+
+  const thresholdMinutes = parseFloat(process.env.AGING_MINUTES_THRESHOLD || '60');
   const maxClonesPerRun = parseInt(process.env.MAX_CLONES_PER_RUN || '5', 10);
+  const agingDate = new Date(Date.now() - thresholdMinutes * 60 * 1000);
+
+  logger.cron(`Starting auto-clone cycle (threshold: ${thresholdMinutes} minute(s), cutoff: ${agingDate.toISOString()})`);
 
   const report = {
+    thresholdMinutes,
+    agingCutoffDate: agingDate.toISOString(),
     timestamp: new Date().toISOString(),
     clonesFinalized: 0,
     clonesInitiated: 0,
@@ -24,107 +30,199 @@ export async function runAutoCloneCycle() {
     logs: [],
   };
 
-  // -------------------------------------------------------------
-  // PHASE 1: Finalize Any In-Flight Remote Upload Clones
-  // -------------------------------------------------------------
-  const pendingVideos = await Video.find({
-    pendingRemoteUploadId: { $exists: true, $ne: null },
-  }).limit(10);
+  const addLog = (msg) => {
+    report.logs.push(msg);
+    logger.info(msg);
+  };
 
-  for (const vid of pendingVideos) {
-    try {
-      const statusRes = await checkRemoteCloneStatus(vid.pendingRemoteUploadId);
+  try {
+    // -------------------------------------------------------------
+    // PHASE 1: Finalize Any In-Flight Remote Upload Clones
+    // -------------------------------------------------------------
+    logger.cron('Phase 1: Checking for in-flight pending remote uploads...');
+    const pendingVideos = await Video.find({
+      pendingRemoteUploadId: { $exists: true, $ne: null },
+    }).limit(10);
 
-      if (statusRes.status === 'finished' && statusRes.linkid) {
-        const oldFileId = vid.fileId;
-        const newFileId = statusRes.linkid;
-
-        vid.fileId = newFileId;
-        vid.lastRefreshedAt = new Date();
-        vid.pendingRemoteUploadId = undefined;
-        vid.streamtapeStatus = 'active';
-        await vid.save();
-
-        await invalidateVideoCaches(vid._id);
-        await deleteStreamtapeFile(oldFileId);
-
-        report.clonesFinalized++;
-        report.logs.push(`Finalized clone for "${vid.title}" (${vid._id}): ${oldFileId} -> ${newFileId}`);
-      } else if (statusRes.status === 'error') {
-        report.logs.push(`Remote upload error for "${vid.title}": ${statusRes.error}. Resetting pending ID.`);
-        vid.pendingRemoteUploadId = undefined;
-        await vid.save();
-      } else {
-        report.logs.push(`Clone in progress for "${vid.title}": status=${statusRes.status}`);
-      }
-    } catch (err) {
-      report.logs.push(`Error checking in-flight clone for "${vid.title}": ${err.message}`);
+    if (pendingVideos.length === 0) {
+      addLog('Phase 1: No pending in-flight uploads found.');
+    } else {
+      addLog(`Phase 1: Found ${pendingVideos.length} pending uploads to check.`);
     }
-  }
 
-  // -------------------------------------------------------------
-  // PHASE 2: Trigger Clones for Aging Videos (> thresholdDays)
-  // -------------------------------------------------------------
-  const agingDate = new Date(Date.now() - thresholdDays * 24 * 60 * 60 * 1000);
+    for (const video of pendingVideos) {
+      const uploadId = video.pendingRemoteUploadId;
+      addLog(`Checking status for video "${video.title}" (${video._id}) with uploadId: ${uploadId}`);
 
-  const agingVideos = await Video.find({
-    $or: [
-      { lastRefreshedAt: { $lt: agingDate } },
-      { lastRefreshedAt: { $exists: false }, createdAt: { $lt: agingDate } },
-    ],
-    pendingRemoteUploadId: { $in: [null, undefined] },
-    streamtapeStatus: { $ne: 'dead' },
-  }).limit(maxClonesPerRun);
+      try {
+        const statusData = await checkRemoteCloneStatus(uploadId);
+        const resolvedLinkId = statusData.linkId || statusData.linkid || statusData.newFileId;
 
-  for (const vid of agingVideos) {
-    try {
-      // 1. Resolve direct stream link
-      const streamInfo = await resolveStreamtapeUrl(vid.fileId);
+        if (statusData.status === 'finished' && resolvedLinkId) {
+          const oldFileId = video.fileId;
+          const newFileId = resolvedLinkId;
+          const newUrl = `https://streamtape.com/v/${newFileId}/`;
 
-      if (!streamInfo.ok || !streamInfo.streamUrl) {
-        if (streamInfo.status === 404) {
-          vid.streamtapeStatus = 'dead';
-          await vid.save();
-          report.deadVideosFound++;
-          report.logs.push(`Video "${vid.title}" (${vid.fileId}) is 404/deleted on Streamtape.`);
+          // Update MongoDB record
+          video.fileId = newFileId;
+          video.streamtapeUrl = newUrl;
+          video.lastRefreshedAt = new Date();
+          video.pendingRemoteUploadId = null;
+          video.streamtapeStatus = 'active';
+          await video.save();
+
+          report.clonesFinalized += 1;
+          logger.success(`Finalized in-flight clone for "${video.title}": ${oldFileId} -> ${newFileId}`);
+          addLog(`Video "${video.title}" updated with new fileId: ${newFileId}`);
+
+          // Invalidate Redis caches for Aurahub
+          try {
+            await invalidateVideoCaches(video._id.toString());
+            addLog(`Invalidated Redis cache for video ${video._id}`);
+          } catch (cacheErr) {
+            logger.warn(`Redis cache invalidation warning for ${video._id}:`, cacheErr.message);
+          }
+
+          // Delete old video from Streamtape to conserve account storage
+          if (oldFileId && oldFileId !== newFileId) {
+            try {
+              await deleteStreamtapeFile(oldFileId);
+              logger.success(`Deleted old Streamtape file ${oldFileId}`);
+              addLog(`Deleted old Streamtape file ${oldFileId}`);
+            } catch (delErr) {
+              logger.warn(`Could not delete old file ${oldFileId}:`, delErr.message);
+              addLog(`Warning: old file ${oldFileId} deletion failed: ${delErr.message}`);
+            }
+          }
+        } else if (statusData.status === 'error') {
+          logger.error(`Remote clone failed for video "${video.title}" (${uploadId}): ${statusData.error}`);
+          addLog(`Remote clone failed for "${video.title}". Resetting pending status.`);
+          video.pendingRemoteUploadId = null;
+          await video.save();
+        } else {
+          addLog(`Remote clone for "${video.title}" still processing (${statusData.status})...`);
         }
+      } catch (err) {
+        logger.error(`Error checking upload ${uploadId}:`, err.message);
+        addLog(`Error checking upload ${uploadId}: ${err.message}`);
+      }
+    }
+
+    // -------------------------------------------------------------
+    // PHASE 2: Identify and Start Cloning for Aging Videos
+    // -------------------------------------------------------------
+    logger.cron(`Phase 2: Scanning for videos older than ${thresholdMinutes} minute(s) (max batch: ${maxClonesPerRun})...`);
+
+    const agingVideos = await Video.find({
+      streamtapeStatus: { $ne: 'dead' },
+      pendingRemoteUploadId: null,
+      $or: [
+        { lastRefreshedAt: { $lt: agingDate } },
+        { lastRefreshedAt: { $exists: false } },
+        { lastRefreshedAt: null },
+      ],
+    })
+      .sort({ lastRefreshedAt: 1, createdAt: 1 })
+      .limit(maxClonesPerRun);
+
+    if (agingVideos.length === 0) {
+      addLog(`Phase 2: No videos older than ${thresholdMinutes} minute(s) require cloning.`);
+    } else {
+      addLog(`Phase 2: Found ${agingVideos.length} candidate videos for auto-cloning.`);
+    }
+
+    for (const video of agingVideos) {
+      const fileId = video.fileId;
+      if (!fileId) {
+        addLog(`Skipping video "${video.title}" (${video._id}): no fileId found.`);
         continue;
       }
 
-      // 2. Start remote upload to clone the file
-      const cloneRes = await startRemoteClone(streamInfo.streamUrl);
+      // Direct Streamtape URL
+      const sourceUrl = video.streamtapeUrl || `https://streamtape.com/v/${fileId}`;
+      addLog(`Initiating direct remote clone for "${video.title}" from: ${sourceUrl}`);
 
-      if (cloneRes.ok && cloneRes.remoteId) {
-        vid.pendingRemoteUploadId = cloneRes.remoteId;
-        await vid.save();
-        report.clonesInitiated++;
-        report.logs.push(`Initiated remote clone for aging video "${vid.title}" (remoteId: ${cloneRes.remoteId})`);
+      try {
+        const cloneResult = await startRemoteClone(sourceUrl);
 
-        // Check if finished immediately (CDN internal transfer often finishes in 2-3s)
-        await new Promise((r) => setTimeout(r, 2500));
-        const quickStatus = await checkRemoteCloneStatus(cloneRes.remoteId);
+        if (!cloneResult.ok) {
+          logger.warn(`Remote clone failed for "${video.title}": ${cloneResult.error}`);
+          addLog(`Warning: Remote clone failed for "${video.title}": ${cloneResult.error}`);
 
-        if (quickStatus.status === 'finished' && quickStatus.linkid) {
-          const oldFileId = vid.fileId;
-          vid.fileId = quickStatus.linkid;
-          vid.lastRefreshedAt = new Date();
-          vid.pendingRemoteUploadId = undefined;
-          vid.streamtapeStatus = 'active';
-          await vid.save();
-
-          await invalidateVideoCaches(vid._id);
-          await deleteStreamtapeFile(oldFileId);
-
-          report.clonesFinalized++;
-          report.logs.push(`Fast-completed clone for "${vid.title}": new fileId ${quickStatus.linkid}`);
+          const lowerErr = (cloneResult.error || '').toLowerCase();
+          if (lowerErr.includes('not found') || lowerErr.includes('deleted') || lowerErr.includes('404')) {
+            video.streamtapeStatus = 'dead';
+            await video.save();
+            report.deadVideosFound += 1;
+            addLog(`Marked video "${video.title}" as dead in DB.`);
+          }
+          continue;
         }
-      } else {
-        report.logs.push(`Failed to start clone for "${vid.title}": ${cloneRes.error}`);
-      }
-    } catch (err) {
-      report.logs.push(`Error processing aging video "${vid.title}": ${err.message}`);
-    }
-  }
 
-  return report;
+        // Streamtape internal clones return linkId immediately
+        if (cloneResult.linkId) {
+          const oldFileId = video.fileId;
+          const newFileId = cloneResult.linkId;
+          const newUrl = `https://streamtape.com/v/${newFileId}/`;
+
+          video.fileId = newFileId;
+          video.streamtapeUrl = newUrl;
+          video.lastRefreshedAt = new Date();
+          video.pendingRemoteUploadId = null;
+          video.streamtapeStatus = 'active';
+          await video.save();
+
+          report.clonesFinalized += 1;
+          logger.success(`Instant clone finalized for "${video.title}": ${oldFileId} -> ${newFileId}`);
+          addLog(`Instant clone finalized for "${video.title}" with new fileId: ${newFileId}`);
+
+          // Invalidate Redis cache
+          try {
+            await invalidateVideoCaches(video._id.toString());
+            addLog(`Invalidated Redis cache for video ${video._id}`);
+          } catch (cacheErr) {
+            logger.warn(`Redis cache invalidation warning for ${video._id}:`, cacheErr.message);
+          }
+
+          // Delete old video from Streamtape
+          if (oldFileId && oldFileId !== newFileId) {
+            try {
+              await deleteStreamtapeFile(oldFileId);
+              logger.success(`Deleted old Streamtape file ${oldFileId}`);
+              addLog(`Deleted old Streamtape file ${oldFileId}`);
+            } catch (delErr) {
+              logger.warn(`Could not delete old file ${oldFileId}:`, delErr.message);
+            }
+          }
+        } else if (cloneResult.remoteId) {
+          video.pendingRemoteUploadId = cloneResult.remoteId;
+          await video.save();
+          report.clonesInitiated += 1;
+          logger.success(`Queued remote clone for "${video.title}"! Upload ID: ${cloneResult.remoteId}`);
+          addLog(`Successfully queued remote clone with upload ID: ${cloneResult.remoteId}`);
+        }
+      } catch (cloneErr) {
+        logger.error(`Error processing candidate "${video.title}":`, cloneErr.message);
+        addLog(`Error processing candidate "${video.title}": ${cloneErr.message}`);
+      }
+    }
+
+    report.durationMs = Date.now() - startTime;
+    logger.cron(`Cycle completed in ${report.durationMs}ms: ${report.clonesFinalized} finalized, ${report.clonesInitiated} initiated, ${report.deadVideosFound} dead.`);
+
+    return {
+      success: true,
+      ...report,
+    };
+  } catch (error) {
+    logger.error('Auto-clone cycle encountered a fatal error:', error.message);
+    const durationMs = Date.now() - startTime;
+
+    return {
+      success: false,
+      error: error.message,
+      durationMs,
+      ...report,
+    };
+  }
 }

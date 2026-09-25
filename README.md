@@ -1,6 +1,6 @@
-# Aurahub Auto-Clone Service
+# Aurahub Auto-Clone Service (Node.js)
 
-A lightweight, standalone Node.js microservice that automatically clones Streamtape videos approaching 75 days old. This prevents Streamtape from permanently purging videos after 90 days.
+A lightweight, standalone Node.js microservice that automatically clones Streamtape videos approaching expiration. This prevents Streamtape from permanently purging videos after 90 days.
 
 ---
 
@@ -9,7 +9,9 @@ A lightweight, standalone Node.js microservice that automatically clones Streamt
 - **Pure Auto-Clone**: Clones aging videos via Streamtape's Remote Upload API (`/remote/add`).
 - **Resilient & Non-Blocking**: Uses `pendingRemoteUploadId` so large video transfers never cause HTTP timeouts. Initiated in one cycle, finalized in the next.
 - **Cache Synchronization**: Automatically invalidates Aurahub's Redis video feeds (`videos_*`) and individual video keys when a file ID is refreshed.
-- **Clean Cleanup**: Deletes the old, expiring file from Streamtape once the new clone is confirmed.
+- **Clean Cleanup**: Deletes the old expiring file from Streamtape once the new clone is confirmed.
+- **Regular Console Logging**: Beautiful, colorized, timestamped stdout/stderr logging (`[INFO]`, `[SUCCESS]`, `[WARN]`, `[ERROR]`, `[CRON]`, `[HTTP]`) for terminal and Render logs tab.
+- **Zero Database Pollution**: Does not store logs in MongoDB. Only modifies the `Video` collection when updating refreshed video IDs.
 - **Render Ready**: Includes a `GET /health` endpoint for Render zero-downtime health checks.
 
 ---
@@ -18,26 +20,27 @@ A lightweight, standalone Node.js microservice that automatically clones Streamt
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Render liveness check (returns `200 OK`) |
+| `GET` | `/` | Service status, runtime, and configured thresholds |
+| `GET` | `/health` | Render liveness check (returns `{"status":"ok"}`) |
 | `GET / POST` | `/api/cron/auto-clone?key=<CRON_SECRET>` | Secured cron trigger endpoint called by **cron-job.org** |
 
 ---
 
 ## Local Setup
 
-1. Copy `.env.example` to `.env`:
+1. Check `.env`:
    ```bash
    cp .env.example .env
    ```
-2. Fill in your environment variables:
-   - `MONGO_URI`: Your MongoDB connection string.
-   - `REDIS_URL`: Your Redis connection string.
-   - `UPLOAD_FOLDER_ID`: Your Streamtape upload folder ID.
-   - `CRON_SECRET`: A random string (e.g. `my_super_secure_key_123`).
-3. Install dependencies and start:
+2. Start the service in dev mode:
    ```bash
-   npm install
    npm run dev
+   ```
+   *(Uses `node --watch src/server.js` so it automatically reloads on code edits).*
+
+3. Test trigger in browser or curl:
+   ```
+   http://localhost:4000/api/cron/auto-clone?key=aurahub_cron_secret_key_2026
    ```
 
 ---
@@ -60,9 +63,9 @@ A lightweight, standalone Node.js microservice that automatically clones Streamt
    - `AURA_API_BASE_URL` (`https://aurahub-api.ashwathama249.workers.dev`)
    - `UPLOAD_FOLDER_ID`
    - `CRON_SECRET`
-   - `AGING_DAYS_THRESHOLD` (`75`)
+   - `AGING_MINUTES_THRESHOLD` (`75`)
    - `MAX_CLONES_PER_RUN` (`5`)
-7. Click **Create Web Service**. Render will give you a public URL (e.g., `https://aurahub-cron.onrender.com`).
+7. Click **Create Web Service**. Render provides your public URL (e.g., `https://aurahub-cron.onrender.com`).
 
 ---
 
