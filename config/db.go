@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
@@ -42,7 +43,34 @@ func InitDB(mongoURI string) (*mongo.Database, error) {
 	MongoDB = client.Database(dbName)
 	slog.Info("Connected to MongoDB successfully", "database", dbName)
 
+	EnsureIndexes(ctx, MongoDB)
+
 	return MongoDB, nil
+}
+
+func EnsureIndexes(ctx context.Context, db *mongo.Database) {
+	collection := db.Collection("videos")
+
+	models := []mongo.IndexModel{
+		{
+			Keys: bson.D{{Key: "pendingRemoteUploadId", Value: 1}},
+			Options: options.Index().SetSparse(true),
+		},
+		{
+			Keys: bson.D{
+				{Key: "streamtapeStatus", Value: 1},
+				{Key: "lastRefreshedAt", Value: 1},
+				{Key: "createdAt", Value: 1},
+			},
+		},
+	}
+
+	_, err := collection.Indexes().CreateMany(ctx, models)
+	if err != nil {
+		slog.Warn("Notice: MongoDB index check skipped or failed", "error", err.Error())
+	} else {
+		slog.Info("Verified MongoDB indexes for videos collection")
+	}
 }
 
 func extractDatabaseName(uri, fallback string) string {

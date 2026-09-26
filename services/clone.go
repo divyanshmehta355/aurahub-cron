@@ -125,6 +125,7 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 							"lastRefreshedAt":       now,
 							"pendingRemoteUploadId": nil,
 							"streamtapeStatus":      "active",
+							"cloneAttempts":         0,
 							"updatedAt":             now,
 						},
 					}
@@ -132,6 +133,7 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 					_, err := collection.UpdateOne(ctx, bson.M{"_id": video.ID}, update)
 					if err != nil {
 						addLog(fmt.Sprintf("Failed to update video %s in DB: %v", video.ID.Hex(), err))
+						time.Sleep(300 * time.Millisecond)
 						continue
 					}
 
@@ -151,19 +153,38 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 						}
 					}
 				} else if statusResult.Status == "error" {
-					addLog(fmt.Sprintf("Remote clone failed for \"%s\" (%s): %s. Resetting pending status.",
-						video.Title, uploadID, statusResult.Error))
-
+					attempts := video.CloneAttempts + 1
 					now := time.Now().UTC()
-					_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
-						"$set": bson.M{
-							"pendingRemoteUploadId": nil,
-							"updatedAt":             now,
-						},
-					})
+
+					if attempts >= 3 {
+						_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
+							"$set": bson.M{
+								"pendingRemoteUploadId": nil,
+								"streamtapeStatus":      "dead",
+								"cloneAttempts":         attempts,
+								"updatedAt":             now,
+							},
+						})
+						report.DeadVideosFound++
+						addLog(fmt.Sprintf("Remote clone failed for \"%s\" (%s): %s. Marked as dead after %d attempts.",
+							video.Title, uploadID, statusResult.Error, attempts))
+					} else {
+						_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
+							"$set": bson.M{
+								"pendingRemoteUploadId": nil,
+								"cloneAttempts":         attempts,
+								"updatedAt":             now,
+							},
+						})
+						addLog(fmt.Sprintf("Remote clone failed for \"%s\" (%s): %s. Attempt %d/3 recorded.",
+							video.Title, uploadID, statusResult.Error, attempts))
+					}
 				} else {
 					addLog(fmt.Sprintf("Remote clone for \"%s\" still processing (%s)...", video.Title, statusResult.Status))
 				}
+
+				// Gentle rate-limiting pause between items
+				time.Sleep(300 * time.Millisecond)
 			}
 		}
 	}
@@ -233,8 +254,8 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 					addLog(fmt.Sprintf("Warning: Remote clone failed for \"%s\": %s", video.Title, cloneResult.Error))
 
 					lowerErr := strings.ToLower(cloneResult.Error)
+					now := time.Now().UTC()
 					if strings.Contains(lowerErr, "not found") || strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "404") {
-						now := time.Now().UTC()
 						_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
 							"$set": bson.M{
 								"streamtapeStatus": "dead",
@@ -243,7 +264,28 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 						})
 						report.DeadVideosFound++
 						addLog(fmt.Sprintf("Marked video \"%s\" as dead in DB.", video.Title))
+					} else {
+						attempts := video.CloneAttempts + 1
+						if attempts >= 3 {
+							_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
+								"$set": bson.M{
+									"streamtapeStatus": "dead",
+									"cloneAttempts":    attempts,
+									"updatedAt":        now,
+								},
+							})
+							report.DeadVideosFound++
+							addLog(fmt.Sprintf("Marked video \"%s\" as dead after %d failed attempts.", video.Title, attempts))
+						} else {
+							_, _ = collection.UpdateOne(ctx, bson.M{"_id": video.ID}, bson.M{
+								"$set": bson.M{
+									"cloneAttempts": attempts,
+									"updatedAt":     now,
+								},
+							})
+						}
 					}
+					time.Sleep(300 * time.Millisecond)
 					continue
 				}
 
@@ -261,6 +303,7 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 							"lastRefreshedAt":       now,
 							"pendingRemoteUploadId": nil,
 							"streamtapeStatus":      "active",
+							"cloneAttempts":         0,
 							"updatedAt":             now,
 						},
 					}
@@ -268,6 +311,7 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 					_, err := collection.UpdateOne(ctx, bson.M{"_id": video.ID}, update)
 					if err != nil {
 						addLog(fmt.Sprintf("DB update failed for video %s: %v", video.ID.Hex(), err))
+						time.Sleep(300 * time.Millisecond)
 						continue
 					}
 
@@ -278,7 +322,11 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 					addLog(fmt.Sprintf("Invalidated Redis cache for video %s", video.ID.Hex()))
 
 					if oldFileID != "" && oldFileID != newFileID {
-						DeleteStreamtapeFile(ctx, cfg.AuraAPIBaseURL, oldFileID)
+						if DeleteStreamtapeFile(ctx, cfg.AuraAPIBaseURL, oldFileID) {
+							addLog(fmt.Sprintf("Deleted old Streamtape file %s", oldFileID))
+						} else {
+							addLog(fmt.Sprintf("Warning: old file %s deletion failed", oldFileID))
+						}
 					}
 				} else if cloneResult.RemoteID != "" {
 					now := time.Now().UTC()
@@ -293,6 +341,9 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 					report.ClonesInitiated++
 					addLog(fmt.Sprintf("Queued remote clone for \"%s\" (uploadId: %s)", video.Title, cloneResult.RemoteID))
 				}
+
+				// Gentle rate-limiting pause between items
+				time.Sleep(300 * time.Millisecond)
 			}
 		}
 	}

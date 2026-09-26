@@ -20,6 +20,7 @@ type Video struct {
 	PendingRemoteUploadID *string             `bson:"pendingRemoteUploadId,omitempty" json:"pendingRemoteUploadId,omitempty"`
 	StreamtapeStatus      string              `bson:"streamtapeStatus,omitempty" json:"streamtapeStatus,omitempty"`
 	StreamtapeURL         string              `bson:"streamtapeUrl,omitempty" json:"streamtapeUrl,omitempty"`
+	CloneAttempts         int                 `bson:"cloneAttempts,omitempty" json:"cloneAttempts,omitempty"`
 	CreatedAt             time.Time           `bson:"createdAt,omitempty" json:"createdAt,omitempty"`
 	UpdatedAt             time.Time           `bson:"updatedAt,omitempty" json:"updatedAt,omitempty"`
 }

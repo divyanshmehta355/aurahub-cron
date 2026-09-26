@@ -116,7 +116,12 @@ func main() {
 		}
 
 		slog.Info("Cron trigger received", "remoteAddr", r.RemoteAddr, "method", r.Method)
-		report := services.RunAutoCloneCycle(r.Context(), cfg)
+
+		// Detach context from HTTP request so premature client disconnects do not abort DB writes or clones
+		cycleCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+		defer cancel()
+
+		report := services.RunAutoCloneCycle(cycleCtx, cfg)
 
 		status := http.StatusOK
 		if !report.Success {
