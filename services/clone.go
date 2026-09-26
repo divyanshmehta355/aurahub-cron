@@ -82,7 +82,11 @@ func RunAutoCloneCycle(ctx context.Context, cfg *config.Config) *AutoCloneReport
 		},
 	}
 
-	findOpts := options.Find().SetLimit(10)
+	phase1Limit := cfg.MaxClonesPerRun
+	if phase1Limit < 10 {
+		phase1Limit = 10
+	}
+	findOpts := options.Find().SetLimit(phase1Limit)
 	cursor, err := collection.Find(ctx, phase1Filter, findOpts)
 	if err != nil {
 		addLog(fmt.Sprintf("Phase 1 query failed: %v", err))

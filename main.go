@@ -137,7 +137,7 @@ func main() {
 		Addr:         ":" + cfg.Port,
 		Handler:      loggedMux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: 180 * time.Second,
 	}
 
 	// Graceful shutdown channel
