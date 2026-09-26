@@ -1,18 +1,20 @@
-# Aurahub Auto-Clone Service (Node.js)
+# Aurahub Auto-Clone Service (Go)
 
-A lightweight, standalone Node.js microservice that automatically clones Streamtape videos approaching expiration. This prevents Streamtape from permanently purging videos after 90 days.
+A high-performance, lightweight Go microservice that automatically clones Streamtape videos approaching expiration before Streamtape's 90-day inactivity purge limit.
+
+Designed for native deployment on **Render** (without Docker) with ultra-low memory consumption (~15MB RAM) and zero cold-sleep memory bloat.
 
 ---
 
-## Architecture & Features
+## Features
 
-- **Pure Auto-Clone**: Clones aging videos via Streamtape's Remote Upload API (`/remote/add`).
-- **Resilient & Non-Blocking**: Uses `pendingRemoteUploadId` so large video transfers never cause HTTP timeouts. Initiated in one cycle, finalized in the next.
-- **Cache Synchronization**: Automatically invalidates Aurahub's Redis video feeds (`videos_*`) and individual video keys when a file ID is refreshed.
-- **Clean Cleanup**: Deletes the old expiring file from Streamtape once the new clone is confirmed.
-- **Regular Console Logging**: Beautiful, colorized, timestamped stdout/stderr logging (`[INFO]`, `[SUCCESS]`, `[WARN]`, `[ERROR]`, `[CRON]`, `[HTTP]`) for terminal and Render logs tab.
-- **Zero Database Pollution**: Does not store logs in MongoDB. Only modifies the `Video` collection when updating refreshed video IDs.
-- **Render Ready**: Includes a `GET /health` endpoint for Render zero-downtime health checks.
+- **Blazing Fast & Ultra-Low Memory**: Written in idiomatic Go with standard library `net/http` and official drivers. Consumes ~15MB RAM on Render.
+- **Native OS Sockets & SRV Resolution**: Connects to MongoDB Atlas (`mongodb+srv://`) and Redis directly without serverless socket limitations.
+- **Resilient 2-Phase Execution**:
+  - **Phase 1**: Checks and finalizes in-flight uploads (`pendingRemoteUploadId`), updates MongoDB, invalidates Redis caches, and deletes old files.
+  - **Phase 2**: Detects aging videos older than `AGING_MINUTES_THRESHOLD` and queues or completes remote clones.
+- **Cache Synchronization**: Automatically invalidates Aurahub Redis video feeds (`videos_*`) and individual video keys.
+- **Render Ready**: Native Go environment (no Docker container required) with zero-downtime health checks at `GET /health`.
 
 ---
 
@@ -20,62 +22,55 @@ A lightweight, standalone Node.js microservice that automatically clones Streamt
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/` | Service status, runtime, and configured thresholds |
-| `GET` | `/health` | Render liveness check (returns `{"status":"ok"}`) |
-| `GET / POST` | `/api/cron/auto-clone?key=<CRON_SECRET>` | Secured cron trigger endpoint called by **cron-job.org** |
+| `GET` | `/` | Service status, runtime, uptime, and thresholds |
+| `GET` | `/health` | Render liveness health check (returns `{"status":"ok"}`) |
+| `GET / POST` | `/api/cron/auto-clone?key=<SECRET>` | Secured trigger endpoint (also accepts `x-cron-key` header) |
 
 ---
 
-## Local Setup
+## Running Locally
 
-1. Check `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-2. Start the service in dev mode:
-   ```bash
-   npm run dev
-   ```
-   *(Uses `node --watch src/server.js` so it automatically reloads on code edits).*
+Run directly through your terminal:
+```bash
+go run .
+```
+*(Loads variables from `.env` automatically on startup).*
 
-3. Test trigger in browser or curl:
-   ```
-   http://localhost:4000/api/cron/auto-clone?key=aurahub_cron_secret_key_2026
-   ```
+Test the trigger:
+```
+http://localhost:4000/api/cron/auto-clone?key=YOUR_CRON_SECRET
+```
 
 ---
 
-## Deploying to Render (Free Web Service)
+## Deploying to Render (Native Go, No Docker)
 
-1. Push this repository to GitHub (e.g. as `aurahub-cron`).
-2. Log into [Render Dashboard](https://dashboard.render.com).
+1. Push this repository to GitHub.
+2. Log into the [Render Dashboard](https://dashboard.render.com).
 3. Click **New +** -> **Web Service**.
-4. Connect your `aurahub-cron` repository.
+4. Connect your repository.
 5. Configure the service:
    - **Name**: `aurahub-cron`
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `npm start`
+   - **Language / Environment**: `Go`
+   - **Branch**: `master` (or `main`)
+   - **Build Command**: `go build -o server .`
+   - **Start Command**: `./server`
    - **Plan**: `Free`
 6. Under **Environment Variables**, add:
-   - `MONGO_URI`
-   - `REDIS_URL`
-   - `AURA_API_BASE_URL` (`https://aurahub-api.ashwathama249.workers.dev`)
-   - `UPLOAD_FOLDER_ID`
-   - `CRON_SECRET`
-   - `AGING_MINUTES_THRESHOLD` (`75`)
-   - `MAX_CLONES_PER_RUN` (`5`)
-7. Click **Create Web Service**. Render provides your public URL (e.g., `https://aurahub-cron.onrender.com`).
+   - `MONGO_URI`: `mongodb+srv://...`
+   - `REDIS_URL`: `redis://...`
+   - `AURA_API_BASE_URL`: `https://aurahub-api-hono.ashwathama249.workers.dev`
+   - `UPLOAD_FOLDER_ID`: `QU3yuiRZZFw`
+   - `CRON_SECRET`: your secret token
+   - `AGING_MINUTES_THRESHOLD`: `60` (or `108000` for 75 days)
+   - `MAX_CLONES_PER_RUN`: `5`
+7. Click **Create Web Service**. Render compiles the Go binary and provides your public URL (e.g., `https://aurahub-cron.onrender.com`).
 
 ---
 
-## Setting up cron-job.org
+## Setting Up Scheduled Invocations
 
-1. Log in to [cron-job.org](https://cron-job.org/en/).
-2. Click **Create Cronjob**.
-3. Fill in:
-   - **Title**: `Aurahub Streamtape Auto-Clone`
-   - **URL**: `https://aurahub-cron.onrender.com/api/cron/auto-clone?key=YOUR_CRON_SECRET`
-   - **Schedule**: Run **Once a Day** (e.g. at 03:00 UTC) or **Once a Week**.
-   - **Request Timeout**: `60 seconds`.
-4. Save the cron job!
+You can trigger the service on a schedule using [cron-job.org](https://cron-job.org/en/):
+- **URL**: `https://aurahub-cron.onrender.com/api/cron/auto-clone?key=YOUR_CRON_SECRET`
+- **Schedule**: Once a day (e.g. 03:00 UTC) or once a week.
+- **Timeout**: `60 seconds`.

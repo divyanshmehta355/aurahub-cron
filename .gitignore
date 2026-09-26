@@ -1,4 +1,10 @@
-node_modules
+# Binaries
+server
+*.exe
+bin/
+
+# Environment files
 .env
+
+# OS files
 .DS_Store
-npm-debug.log*
